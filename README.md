@@ -2,12 +2,12 @@
 
 
 This repository contains the official implementation of  
-**A Snapshot of Influence: A Local Data Attribution Framework for Online Reinforcement Learning** (NeurIPS 2025 <span style="color:red">Oral</span>), the first framework of data attribution for online reinforcement learning.
+**A Snapshot of Influence: A Local Data Attribution Framework for Online Reinforcement Learning** (NeurIPS 2025 ${\textsf{\color{red}oral}}$), the first framework of data attribution for online reinforcement learning.
 We also propose Iterative Influence-Based Filtering (IIF), an algorithm that improves sample efficiency, computational efficiency, and final returns for PPO. 
 
 Our paper can be accessed [here](https://arxiv.org/abs/2510.12345).
 
-![diagram](figs/diagram.png)
+<img src="figs/diagram.png" width="400">
 
 ## Repository Structure
 
