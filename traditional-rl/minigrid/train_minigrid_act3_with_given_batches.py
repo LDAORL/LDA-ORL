@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch as th
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from tqdm import tqdm
 
 import wandb
@@ -125,23 +125,39 @@ def parse_args():
                         help="WandB project name.")
     parser.add_argument("--run_name", type=str, default="ppo_minigrid_offline_run",
                         help="WandB run name.")
+    parser.add_argument('--optimizer_class', type=str, default="SGD")
     
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--initial_policy", type=str, default='',
                         help="Path to an initial policy checkpoint.")
     
     parser.add_argument('--env_name', type=str, default="MiniGrid-Empty-5x5-v0")
+    parser.add_argument('--n_actions', type=int, default=3)
     args = parser.parse_args()
     return args
+
+# Define a wrapper to restrict the action space
+class RestrictedActionSpaceWrapper(gym.Wrapper):
+    def __init__(self, env, n_actions):
+        super().__init__(env)
+        # Redefine action space to only include Left (0), Right (1), Forward (2)
+        self.action_space = gym.spaces.Discrete(n_actions)  # 3 actions instead of 7
+        # Mapping from new action indices to original MiniGrid actions
+        self.action_mapping = {i:i for i in range(n_actions)}
+        
+    def step(self, action):
+        # Map the restricted action to the original action
+        mapped_action = self.action_mapping[action]
+        # Call the original environment's step function
+        obs, reward, terminated, truncated, info = self.env.step(mapped_action)
+        return obs, reward, terminated, truncated, info
 
 # -------------------------------
 # Main training loop for offline batches
 # -------------------------------
 def main():
     args = parse_args()
-    
-    print('env is :', args.env_name)
-    
+        
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -162,10 +178,14 @@ def main():
     # Create the environment.
     # We use MiniGrid with image-only observations via ImgObsWrapper.
     base_env = gym.make(args.env_name)
+    base_env = RestrictedActionSpaceWrapper(base_env, args.n_actions)  # restrict action space to Left, Right, Forward
     base_env = RecordEpisodeStatistics(base_env)
     base_env = ImgObsWrapper(base_env)
     # Optionally, check env compliance.
     check_env(base_env, warn=True)
+    
+    print('env is :', args.env_name)
+    print('number of actions:', base_env.action_space.n)
 
     # Use CPU for offline training.
     device = "cpu"
@@ -174,7 +194,7 @@ def main():
     policy_kwargs = {
         "features_extractor_class": CustomCNN,
         "features_extractor_kwargs": {"features_dim": config.features_dim},
-        "optimizer_class": SGD,
+        "optimizer_class": SGD if args.optimizer_class == "SGD" else Adam,
     }
     
     # Initialize PPO with CnnPolicy.
@@ -193,6 +213,7 @@ def main():
         normalize_advantage=args.normalize_advantage,
         policy_kwargs=policy_kwargs
     )
+    print(model.policy.optimizer)  # Print the optimizer to verify it's set correctly
     
     if args.initial_policy:
         import copy
@@ -214,7 +235,7 @@ def main():
             rollout_data = pickle.load(f)
             
         if rollout_data is None:
-            print('encountering None batch, exiting')
+            print(f'encountering None batch at t={t}, exiting')
             # Save checkpoint every 320 batches.
             rollout_idx = args.n_batches // 320
             cp_path = osp.join(args.save_path, f"policy_after_rollout_{rollout_idx}.zip")
@@ -288,7 +309,7 @@ def main():
             rollout_idx = (t + 1) // 320
             cp_path = osp.join(args.save_path, f"policy_after_rollout_{rollout_idx}.zip")
             model.save(cp_path)
-        model.save(osp.join(args.save_path, f"policy_grad_{t+1}.zip"))
+            model.save(osp.join(args.save_path, f"policy_grad_{t+1}.zip"))
     
     final_model_path = osp.join(args.save_path, "final_policy.zip")
     model.save(final_model_path)

@@ -5,56 +5,12 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import gymnasium as gym
-import minigrid
 from gymnasium.wrappers import RecordEpisodeStatistics
-from minigrid.wrappers import ImgObsWrapper
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from wandb.integration.sb3 import WandbCallback
 import wandb
-
-# =======================
-# Custom CNN Feature Extractor
-# =======================
-class CustomCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 128):
-        super(CustomCNN, self).__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 16, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        with th.no_grad():
-            sample_input = th.as_tensor(observation_space.sample()[None]).float()
-            n_flatten = self.cnn(sample_input).shape[1]
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU()
-        )
-
-    def forward(self, observations: th.Tensor) -> th.Tensor:
-        return self.linear(self.cnn(observations))
-
-# Define a wrapper to restrict the action space
-class RestrictedActionSpaceWrapper(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        # Redefine action space to only include Left (0), Right (1), Forward (2)
-        self.action_space = gym.spaces.Discrete(3)  # 3 actions instead of 7
-        # Mapping from new action indices to original MiniGrid actions
-        self.action_mapping = {0: 0, 1: 1, 2: 2}  # 0: Left, 1: Right, 2: Forward
-
-    def step(self, action):
-        # Map the restricted action to the original action
-        mapped_action = self.action_mapping[action]
-        # Call the original environment's step function
-        obs, reward, terminated, truncated, info = self.env.step(mapped_action)
-        return obs, reward, terminated, truncated, info
 
 # =======================
 # Environment creation
@@ -62,9 +18,8 @@ class RestrictedActionSpaceWrapper(gym.Wrapper):
 def make_env(env_name):
     def _init():
         env = gym.make(env_name)
-        env = RestrictedActionSpaceWrapper(env)  # restrict action space to Left, Right, Forward
         env = RecordEpisodeStatistics(env)  # for episode stats
-        env = ImgObsWrapper(env)            # returns only the image observation (3,7,7)
+        # No image wrapper needed since LunarLander-v2 has vector observations
         return env
     return _init
 
@@ -132,28 +87,26 @@ class SaveStatesCallback(BaseCallback):
 # =======================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train PPO on MiniGrid with custom CNN and data attribution logging."
+        description="Train PPO on LunarLander-v2 with data attribution logging."
     )
     # Training hyperparameters
     parser.add_argument("--total_timesteps", type=int, default=40960,
                         help="Total timesteps for training.")
     parser.add_argument("--learning_rate", type=float, default=0.01,
                         help="Learning rate for the optimizer.")
-    parser.add_argument("--features_dim", type=int, default=256,
-                        help="Feature dimension for the custom CNN extractor.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed.")
     
     # WandB settings.
-    parser.add_argument("--project_name", type=str, default="minigrid-rl",
+    parser.add_argument("--project_name", type=str, default="lunarlander-rl",
                         help="WandB project name.")
-    parser.add_argument("--run_name", type=str, default="ppo_minigrid_run",
+    parser.add_argument("--run_name", type=str, default="ppo_lunarlander_run",
                         help="WandB run name.")
     parser.add_argument("--save_path", type=str, default="saved_models",
                         help="Directory to save models and mini-batches.")
     parser.add_argument('--optimizer_class', type=str, default="SGD")
     
-    parser.add_argument('--env_name', type=str, default="MiniGrid-Empty-5x5-v0",
+    parser.add_argument('--env_name', type=str, default="LunarLander-v2",
                         help="Name of the environment to train on.")
     return parser.parse_args()
 
@@ -184,28 +137,24 @@ def main():
     env = DummyVecEnv([make_env(args.env_name)])
     env = VecMonitor(env)
     
-    print('env:', args.env_name)
-    print('number of actions:', env.action_space.n)
-    
-    # Define policy keyword arguments
+    # Define policy keyword arguments.
+    # For LunarLander-v2 with vector observations, we use MlpPolicy.
     policy_kwargs = dict(
-        features_extractor_class=CustomCNN,
-        features_extractor_kwargs=dict(features_dim=config.features_dim),
         optimizer_class=th.optim.SGD if args.optimizer_class == "SGD" else th.optim.Adam,
     )
     
-    # Use "CnnPolicy" since we're using image observations
-    # If you're not visualizing and the input is small, ensure you use your custom CNN extractor.
     model = PPO(
-        "CnnPolicy",
+        "MlpPolicy",  # Using MlpPolicy for vector observations
         env,
         verbose=1,
-        device="cuda" if th.cuda.is_available() else "cpu",
+        device="cpu",
         learning_rate=config.learning_rate,
         seed=config.seed,
         policy_kwargs=policy_kwargs,
         tensorboard_log="./tb_logs/"
     )
+    
+    print(model.policy.optimizer)  # Print the optimizer to verify it's set correctly
     
     # Save an initial copy of the policy for reference.
     model.save(os.path.join(args.save_path, "policy_grad_0.zip"))

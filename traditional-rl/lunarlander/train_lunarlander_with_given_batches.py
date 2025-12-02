@@ -3,11 +3,11 @@ import os
 import os.path as osp
 import pickle
 import numpy as np
+np.float_ = np.float64
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch as th
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from tqdm import tqdm
 
 import wandb
@@ -17,36 +17,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from gymnasium import spaces
 import gymnasium as gym
-import minigrid
 from gymnasium.wrappers import RecordEpisodeStatistics
-from minigrid.wrappers import ImgObsWrapper
 
-# -------------------------------
-# Custom CNN extractor for image observations (input: (3,7,7))
-# -------------------------------
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-
-class CustomCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 128):
-        super(CustomCNN, self).__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]  # expect 3
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 16, kernel_size=3, stride=1),  # (16, 5, 5)
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1),                # (32, 3, 3)
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        with th.no_grad():
-            sample_input = th.as_tensor(observation_space.sample()[None]).float()
-            n_flatten = self.cnn(sample_input).shape[1]
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU()
-        )
-
-    def forward(self, observations: th.Tensor) -> th.Tensor:
-        return self.linear(self.cnn(observations))
 
 # -------------------------------
 # Offline state-saving callback
@@ -76,7 +48,7 @@ class SaveStatesCallback(BaseCallback):
 # -------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Offline PPO training on MiniGrid with custom CNN, wandb logging, and batch checkpointing."
+        description="Offline PPO training on LunarLander-v2 with wandb logging and batch checkpointing."
     )
     # Training hyperparameters.
     parser.add_argument("--total_timesteps", type=int, default=100_000,
@@ -96,13 +68,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size for training.")
     
-    # CNN extractor parameter.
-    parser.add_argument("--features_dim", type=int, default=256,
-                        help="Feature dimension for the custom CNN extractor.")
-
     # Environment hyperparameters.
-    # For our current use case, we use MiniGrid-Empty-5x5.
-    
+    parser.add_argument('--env_name', type=str, default="LunarLander-v2",
+                        help="Name of the environment (default: LunarLander-v2)")
     # Save path for models and states.
     parser.add_argument("--save_path", type=str, default="saved_models",
                         help="Directory to save model parameters and states.")
@@ -121,35 +89,18 @@ def parse_args():
                         help="Whether to normalize advantages.")
     
     # WandB settings.
-    parser.add_argument("--project_name", type=str, default="minigrid-rl",
+    parser.add_argument("--project_name", type=str, default="lunarlander-rl",
                         help="WandB project name.")
-    parser.add_argument("--run_name", type=str, default="ppo_minigrid_offline_run",
+    parser.add_argument("--run_name", type=str, default="ppo_lunarlander_offline_run",
                         help="WandB run name.")
+    parser.add_argument('--optimizer_class', type=str, default="SGD")
     
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--initial_policy", type=str, default='',
                         help="Path to an initial policy checkpoint.")
     
-    parser.add_argument('--env_name', type=str, default="MiniGrid-Empty-5x5-v0")
-    parser.add_argument('--n_actions', type=int, default=3)
     args = parser.parse_args()
     return args
-
-# Define a wrapper to restrict the action space
-class RestrictedActionSpaceWrapper(gym.Wrapper):
-    def __init__(self, env, n_actions):
-        super().__init__(env)
-        # Redefine action space to only include Left (0), Right (1), Forward (2)
-        self.action_space = gym.spaces.Discrete(n_actions)  # 3 actions instead of 7
-        # Mapping from new action indices to original MiniGrid actions
-        self.action_mapping = {i:i for i in range(n_actions)}
-        
-    def step(self, action):
-        # Map the restricted action to the original action
-        mapped_action = self.action_mapping[action]
-        # Call the original environment's step function
-        obs, reward, terminated, truncated, info = self.env.step(mapped_action)
-        return obs, reward, terminated, truncated, info
 
 # -------------------------------
 # Main training loop for offline batches
@@ -175,31 +126,46 @@ def main():
     global_steps = 0
 
     # Create the environment.
-    # We use MiniGrid with image-only observations via ImgObsWrapper.
-    base_env = gym.make(args.env_name)
-    base_env = RestrictedActionSpaceWrapper(base_env, args.n_actions)  # restrict action space to Left, Right, Forward
-    base_env = RecordEpisodeStatistics(base_env)
-    base_env = ImgObsWrapper(base_env)
+    if args.env_name == 'FrozenLake-v1':
+        from gymnasium.envs.toy_text.frozen_lake import generate_random_map
+        env = gym.make(args.env_name, map_name='4x4', is_slippery=False)
+    elif args.env_name == "highway-v0":
+        import highway_env
+        env = gym.make("highway-v0", render_mode=None, config={
+            "observation": {
+                "type": "Kinematics"
+            },
+            "action": {
+                "type": "DiscreteMetaAction"
+            },
+            "vehicles_count": 10,
+        })
+    elif "merge" in args.env_name:
+        import highway_env
+        env = gym.make(args.env_name, render_mode=None)
+    else:
+        env = gym.make(args.env_name)
+    env = RecordEpisodeStatistics(env)
     # Optionally, check env compliance.
-    check_env(base_env, warn=True)
+    # check_env(env, warn=True)
     
     print('env is :', args.env_name)
-    print('number of actions:', base_env.action_space.n)
+    print('observation space:', env.observation_space)
+    # print('number of actions:', env.action_space.n)
 
     # Use CPU for offline training.
     device = "cpu"
     print(f"Using device: {device}")
 
+    # For LunarLander, we use MlpPolicy so no custom feature extractor is needed.
     policy_kwargs = {
-        "features_extractor_class": CustomCNN,
-        "features_extractor_kwargs": {"features_dim": config.features_dim},
-        "optimizer_class": SGD,
+        "optimizer_class": SGD if args.optimizer_class == "SGD" else Adam,
     }
     
-    # Initialize PPO with CnnPolicy.
+    # Initialize PPO with MlpPolicy.
     model = PPO(
-        "CnnPolicy",
-        base_env,
+        "MlpPolicy",
+        env,
         verbose=1,
         device=device,
         learning_rate=config.learning_rate,
@@ -212,6 +178,7 @@ def main():
         normalize_advantage=args.normalize_advantage,
         policy_kwargs=policy_kwargs
     )
+    print(model.policy.optimizer)  # Print the optimizer to verify it's set correctly
     
     if args.initial_policy:
         import copy
@@ -233,18 +200,15 @@ def main():
             rollout_data = pickle.load(f)
             
         if rollout_data is None:
-            print(f'encountering None batch at t={t}, exiting')
-            # Save checkpoint every 320 batches.
+            print(f'encountered None batch at t={t}, exiting')
             rollout_idx = args.n_batches // 320
             cp_path = osp.join(args.save_path, f"policy_after_rollout_{rollout_idx}.zip")
             model.save(cp_path)
-
             model.save(osp.join(args.save_path, f"policy_grad_{args.n_batches}.zip"))
             break
         
         # Schedule clip_range based on progress.
         progress = 1 - ((int(t/320) + 1) / (args.total_updates / 320))
-        # If clip_range is a callable (schedule), use it; else, use constant value.
         clip_range = model.clip_range(progress) if callable(model.clip_range) else model.clip_range
 
         # Unpack rollout data.
@@ -292,11 +256,11 @@ def main():
             entropy_loss = -th.mean(entropy)
         
         loss = policy_loss + model.ent_coef * entropy_loss + model.vf_coef * value_loss
-        
+
         # Optimization step.
         model.policy.optimizer.zero_grad()
         loss.backward()
-        # Scale gradients (if desired).
+        # Scale gradients if desired.
         for param in model.policy.parameters():
             if param.grad is not None:
                 param.grad.data *= batch_size / config.batch_size

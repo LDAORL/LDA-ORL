@@ -58,9 +58,26 @@ def flatten_ob_act_prob_adv(ob, act, prob, adv):
 def flatten_ob_act_prob_adv_rew_ret(ob, act, prob, adv, rew, ret):
     return tuple(np.concatenate((ob.cpu().numpy().flatten(), act.cpu().numpy().flatten(), prob.cpu().numpy().flatten(), adv.cpu().numpy().flatten(), rew.cpu().numpy().flatten(), ret.cpu().numpy().flatten())))
 
-def flatten_ob_act_prob_adv_ret(ob, act, prob, adv, ret):
-    return tuple(np.concatenate((ob.cpu().numpy().flatten(), act.cpu().numpy().flatten(), prob.cpu().numpy().flatten(), adv.cpu().numpy().flatten(), ret.cpu().numpy().flatten())))
+def update_scores_for_samples(batch, scores):
+    global d_global
+    batch_size = batch.observations.shape[0]
+    for i in range(batch_size):
+        # tpl = flatten_ob_act_tensors(batch.observations[i], batch.actions[i])
+        tpl = flatten_ob_act_prob_adv(batch.observations[i], batch.actions[i], batch.old_log_prob[i], batch.advantages[i])
+        # print(tpl)
+        if tpl not in d_global:
+            d_global[tpl] = []
 
+        d_global[tpl].append(scores[i])
+        
+requires_grad_params = set([
+    'mlp_extractor.policy_net.0.weight',
+    'mlp_extractor.policy_net.0.bias',
+    'mlp_extractor.policy_net.2.weight',
+    'mlp_extractor.policy_net.2.bias',
+    'action_net.weight',
+    'action_net.bias'
+])
 
 def load_in_train_data():
     # Load the rollout buffer.
@@ -83,7 +100,7 @@ def load_in_train_data():
     device = model_ref.device
     # Convert sample components to torch tensors.
     obs = torch.tensor(sample["observations"], dtype=torch.float32, device=device)
-    target_actions = torch.tensor(sample["actions"], dtype=torch.float32, device=device)
+    target_actions = torch.tensor(sample["actions"], dtype=torch.long, device=device)
     advantages = torch.tensor(sample["advantages"], dtype=torch.float32, device=device)
 
     # # Flatten observations if they are grouped (e.g., shape [num_episodes, T, ...]).
@@ -110,9 +127,8 @@ def load_in_train_data():
         elif obs.ndim == len(obs_shape):
             obs = obs.unsqueeze(0)
 
-    target_actions = target_actions.squeeze(1)
-    # if target_actions.ndim > 1:
-    #     target_actions = target_actions.flatten()
+    if target_actions.ndim > 1:
+        target_actions = target_actions.flatten()
 
     if advantages.ndim > 1:
         advantages = advantages.flatten()
@@ -136,12 +152,20 @@ obs, act, advantages, sample = load_in_train_data()
 
 # register hooks for the model
 _xs, _gs = {}, {}
+conv_params = {}
 for name, module in model_ref.policy.named_modules():
     if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
         if 'value_net' in name:
             continue
         print('registering hook for', name)
         
+        if isinstance(module, torch.nn.Conv2d):
+            conv_params[name] = {
+                'kernel_size': module.kernel_size,
+                'stride':      module.stride,
+                'padding':     module.padding
+            }        
+
         # we'll store val‐hooks and train‐activations here
         _xs[name] = None
         _gs[name] = None
@@ -163,22 +187,33 @@ for name, module in model_ref.policy.named_modules():
 ############################
 ##### forward & backward on training
 ############################
-adjusted_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-# adjusted_advantages = advantages
+# adjusted_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+# Break the sequence into chunks of length 64 and normalize within each chunk using vectorized operations
+chunk_size = 64
+num_chunks = 32
+
+# Reshape into chunks and compute mean and std along the chunk dimension
+chunks = advantages.view(num_chunks, chunk_size)
+chunk_means = chunks.mean(dim=1, keepdim=True)
+chunk_stds = chunks.std(dim=1, keepdim=True) + 1e-8
+
+# Normalize each chunk
+normalized_chunks = (chunks - chunk_means) / chunk_stds
+
+# Flatten back and remove the padding
+adjusted_advantages = normalized_chunks.view(-1)[:advantages.shape[0]]
 
 # Zero gradients.
 model_ref.policy.optimizer.zero_grad()
 
 # Evaluate current log probabilities (and entropy) for the given observation-action pair.
 # Note: evaluate_actions expects the inputs to have a batch dimension.
-print(obs.shape, act.shape)
-values, new_log_prob, entropy = model_ref.policy.evaluate_actions(obs, act)
-values = values.flatten()
+values, new_log_prob, entropy = model_ref.policy.evaluate_actions(obs, act.long().flatten())
+# values = values.flatten()
 
 # Compute the probability ratio.
 ratio = torch.exp(new_log_prob - new_log_prob.detach())
-
-print('ratio', ratio.shape)
 
 # Compute the surrogate objective (clipped).
 policy_loss_1 = ratio * adjusted_advantages
@@ -214,9 +249,8 @@ _xs, _gs = {}, {}
 
 model_ref.policy.optimizer.zero_grad()
 
-# selected_log_probs, _ = get_action_prob(model_ref, obs, act)
-_, new_log_prob, _ = model_ref.policy.evaluate_actions(obs, act)
-loss = -torch.mean(advantages * new_log_prob)
+selected_log_probs, _ = get_action_prob(model_ref, obs, act)
+loss = -torch.mean(advantages * selected_log_probs)
 
 loss.backward()
 
@@ -236,39 +270,78 @@ _val_xs, _val_gs = _xs, _gs
 ############################
 
 def compute_sample_ip_layers_vec(train_xs, train_gs, val_xs, val_gs):
+    """
+    Compute influence inner-product for both Linear and Conv2d layers.
+
+    train_xs, train_gs: dict layer_name → Tensor of train activations and grads
+    val_xs,   val_gs:   dict layer_name → Tensor of val   activations and grads
+    conv_params: global dict layer_name → {'kernel_size','stride','padding'}
+    """
     layers = list(train_xs.keys())
+    # number of train samples
     n_train = next(iter(train_xs.values())).shape[0]
-    sample_IP = torch.zeros(n_train, dtype=next(iter(train_xs.values())).dtype)
+    # initialize output
+    sample_IP = torch.zeros(
+        n_train,
+        dtype=next(iter(train_xs.values())).dtype,
+        device=next(iter(train_xs.values())).device
+    )
+
     for layer in layers:
-        X_t = train_xs[layer]  # [n_train, F]
-        G_t = train_gs[layer]  # [n_train, G]
-        X_v = val_xs[layer]    # [n_val, F]
-        G_v = val_gs[layer]    # [n_val, G]
-        # sum over val j: P = sum_j g_v[j].T @ x_v[j] -> [G, F]
-        P = G_v.transpose(0,1) @ X_v  # [G, F]
-        # Q_i = g_t[i].T @ x_t[i] -> [G, F] for each i. Vectorize:
-        Q = G_t.unsqueeze(2) * X_t.unsqueeze(1)  # [n_train, G, F]
-        # inner products:
-        sample_IP += (Q * P.unsqueeze(0)).sum(dim=(1,2))  # [n_train]
-        
-        bias_sum = G_v.sum(dim=0)
-        sample_IP += (G_t * bias_sum.unsqueeze(0)).sum(dim=1)
+        X_t = train_xs[layer]
+        G_t = train_gs[layer]
+        X_v = val_xs[layer]
+        G_v = val_gs[layer]
+
+        # Linear layer case
+        if X_t.dim() == 2:
+            # weight-block
+            P = G_v.transpose(0,1) @ X_v              # [G, F]
+            Q = G_t.unsqueeze(2) * X_t.unsqueeze(1)   # [n_train, G, F]
+            sample_IP += (Q * P.unsqueeze(0)).sum(dim=(1,2))
+            # bias-block
+            bias_sum = G_v.sum(dim=0)                 # [G]
+            sample_IP += (G_t * bias_sum.unsqueeze(0)).sum(dim=1)
+
+        # Conv2d layer case
+        else:
+            # get stored conv params
+            p = conv_params[layer]
+            # unfold val inputs → [n_val, Cin*kH*kW, L]
+            patches_v = F.unfold(
+                X_v,
+                kernel_size=p['kernel_size'],
+                stride=p['stride'],
+                padding=p['padding']
+            )
+            n_val, C_out, H1, W1 = G_v.shape
+            # flatten grads → [n_val, C_out, L]
+            Gv_flat = G_v.view(n_val, C_out, -1)
+            # weight-grads per val → [n_val, C_out, Cin*kH*kW]
+            wg_v = torch.matmul(Gv_flat, patches_v.transpose(1,2))
+            # aggregate val contributions
+            P = wg_v.sum(dim=0)                       # [C_out, Cin*kH*kW]
+
+            # train side unfold
+            patches_t = F.unfold(
+                X_t,
+                kernel_size=p['kernel_size'],
+                stride=p['stride'],
+                padding=p['padding']
+            )
+            n_tr = G_t.shape[0]
+            Gt_flat = G_t.view(n_tr, C_out, -1)
+            wg_t = torch.matmul(Gt_flat, patches_t.transpose(1,2))  # [n_tr, C_out, Cin*kH*kW]
+            sample_IP += (wg_t * P.unsqueeze(0)).sum(dim=(1,2))
+
+            # bias term
+            bias_sum = G_v.sum(dim=(0,2,3))           # [C_out]
+            tr_bias = G_t.sum(dim=(2,3))              # [n_tr, C_out]
+            sample_IP += (tr_bias * bias_sum.unsqueeze(0)).sum(dim=1)
+
     return sample_IP
 
 out = compute_sample_ip_layers_vec(_train_xs, _train_gs, _val_xs, _val_gs)
-
-
-
-def flatten_ob_act_prob_adv_ret(ob, act, prob, adv, ret):
-    return tuple(np.concatenate((ob.cpu().numpy().flatten(), act.cpu().numpy().flatten(), prob.cpu().numpy().flatten(), adv.cpu().numpy().flatten(), ret.cpu().numpy().flatten())))
-
-d_global = {}
-for i in range(2048):
-    tpl = flatten_ob_act_prob_adv(sample['observations'][i], sample['actions'][i], sample['log_probs'][i], sample['advantages'][i])
-    if tpl in d_global:
-        d_global[tpl].append(out[i].cpu().numpy())
-    else:
-        d_global[tpl] = [out[i].cpu().numpy()]
 
 os.makedirs(args.output_dir, exist_ok=True)
 # torch.save({
@@ -284,6 +357,16 @@ os.makedirs(args.output_dir, exist_ok=True)
 #     # 'act_0': act[0],
 #     'ip': out
 # }, os.path.join(args.output_dir, 'inner_product.pth'))
+
+
+d_global = {}
+for i in range(2048):
+    tpl = flatten_ob_act_prob_adv(sample['observations'][i], sample['actions'][i], sample['log_probs'][i], sample['advantages'][i])
+    if tpl in d_global:
+        d_global[tpl].append(out[i].cpu().numpy())
+    else:
+        d_global[tpl] = [out[i].cpu().numpy()]
+
 pickle.dump({
     'ip': out,
     'd_global': d_global

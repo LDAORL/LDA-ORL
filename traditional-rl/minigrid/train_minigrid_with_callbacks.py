@@ -2,49 +2,52 @@ import argparse
 import os
 import pickle
 import numpy as np
-np.float_ = np.float64
 import torch as th
 import torch.nn as nn
 import gymnasium as gym
+import minigrid
 from gymnasium.wrappers import RecordEpisodeStatistics
+from minigrid.wrappers import ImgObsWrapper
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from wandb.integration.sb3 import WandbCallback
 import wandb
+
+# =======================
+# Custom CNN Feature Extractor
+# =======================
+class CustomCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 128):
+        super(CustomCNN, self).__init__(observation_space, features_dim)
+        n_input_channels = observation_space.shape[0]
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 16, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        with th.no_grad():
+            sample_input = th.as_tensor(observation_space.sample()[None]).float()
+            n_flatten = self.cnn(sample_input).shape[1]
+        self.linear = nn.Sequential(
+            nn.Linear(n_flatten, features_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        return self.linear(self.cnn(observations))
 
 # =======================
 # Environment creation
 # =======================
 def make_env(env_name):
     def _init():
-        if env_name == 'FrozenLake-v1':
-            from gymnasium.envs.toy_text.frozen_lake import generate_random_map
-            env = gym.make(env_name, map_name="4x4", is_slippery=False)
-        elif "highway-v0" in env_name:
-            import highway_env
-            vehicle_count = env_name.split("-")[-1]
-            if vehicle_count.isdigit():
-                vehicle_count = int(vehicle_count)
-            else:
-                vehicle_count = 10
-            print('vehicle_count', vehicle_count)
-            env = gym.make("highway-v0", render_mode=None, config={
-                "observation": {
-                    "type": "Kinematics"
-                },
-                "action": {
-                    "type": "DiscreteMetaAction"
-                },
-                "vehicles_count": vehicle_count,
-            })
-        elif "merge" in env_name:
-            import highway_env
-            env = gym.make(env_name, render_mode=None)
-        else:
-            env = gym.make(env_name)
+        env = gym.make(env_name)
         env = RecordEpisodeStatistics(env)  # for episode stats
-        # Remove ImgObsWrapper since CartPole has vector observations
+        env = ImgObsWrapper(env)            # returns only the image observation (3,7,7)
         return env
     return _init
 
@@ -112,26 +115,28 @@ class SaveStatesCallback(BaseCallback):
 # =======================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train PPO on CartPole with data attribution logging."
+        description="Train PPO on MiniGrid with custom CNN and data attribution logging."
     )
     # Training hyperparameters
     parser.add_argument("--total_timesteps", type=int, default=40960,
                         help="Total timesteps for training.")
     parser.add_argument("--learning_rate", type=float, default=0.01,
                         help="Learning rate for the optimizer.")
+    parser.add_argument("--features_dim", type=int, default=256,
+                        help="Feature dimension for the custom CNN extractor.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed.")
     
     # WandB settings.
-    parser.add_argument("--project_name", type=str, default="cartpole-rl",
+    parser.add_argument("--project_name", type=str, default="minigrid-rl",
                         help="WandB project name.")
-    parser.add_argument("--run_name", type=str, default="ppo_cartpole_run",
+    parser.add_argument("--run_name", type=str, default="ppo_minigrid_run",
                         help="WandB run name.")
     parser.add_argument("--save_path", type=str, default="saved_models",
                         help="Directory to save models and mini-batches.")
     parser.add_argument('--optimizer_class', type=str, default="SGD")
     
-    parser.add_argument('--env_name', type=str, default="CartPole-v1",
+    parser.add_argument('--env_name', type=str, default="MiniGrid-Empty-5x5-v0",
                         help="Name of the environment to train on.")
     return parser.parse_args()
 
@@ -162,17 +167,20 @@ def main():
     env = DummyVecEnv([make_env(args.env_name)])
     env = VecMonitor(env)
     
-    # Define policy keyword arguments.
-    # For CartPole with vector observations, we use MlpPolicy.
+    # Define policy keyword arguments
     policy_kwargs = dict(
+        features_extractor_class=CustomCNN,
+        features_extractor_kwargs=dict(features_dim=config.features_dim),
         optimizer_class=th.optim.SGD if args.optimizer_class == "SGD" else th.optim.Adam,
     )
     
+    # Use "CnnPolicy" since we're using image observations
+    # If you're not visualizing and the input is small, ensure you use your custom CNN extractor.
     model = PPO(
-        "MlpPolicy",  # Changed from CnnPolicy to MlpPolicy
+        "CnnPolicy",
         env,
         verbose=1,
-        device="cpu",
+        device="cuda" if th.cuda.is_available() else "cpu",
         learning_rate=config.learning_rate,
         seed=config.seed,
         policy_kwargs=policy_kwargs,
@@ -191,8 +199,8 @@ def main():
         for mini_batch in original_get(batch_size):
             model._update_counter += 1
             batch_filename = os.path.join(args.save_path, f"batch_{model._update_counter}.pkl")
-            with open(batch_filename, "wb") as f:
-                pickle.dump(mini_batch, f)
+            # with open(batch_filename, "wb") as f:
+            #     pickle.dump(mini_batch, f)
             yield mini_batch
     model.rollout_buffer.get = patched_get
     
@@ -200,8 +208,9 @@ def main():
     original_optimizer_step = model.policy.optimizer.step
     def patched_optimizer_step(*opt_args, **opt_kwargs):
         result = original_optimizer_step(*opt_args, **opt_kwargs)
-        checkpoint_filename = os.path.join(args.save_path, f"policy_grad_{model._update_counter}.zip")
-        model.save(checkpoint_filename)
+        if model._update_counter % 320 == 0:
+            checkpoint_filename = os.path.join(args.save_path, f"policy_grad_{model._update_counter}.zip")
+            model.save(checkpoint_filename)
         return result
     model.policy.optimizer.step = patched_optimizer_step
     
