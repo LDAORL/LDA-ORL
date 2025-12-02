@@ -7,7 +7,7 @@ We also propose Iterative Influence-Based Filtering (IIF), an algorithm that imp
 
 Our paper can be accessed [here](https://arxiv.org/abs/2510.12345).
 
-<img src="figs/diagram.png" width="400">
+<img src="figs/diagram.png" width="700">
 
 ## Repository Structure
 
